@@ -1,0 +1,3 @@
+[submodule "libread"]
+	path = libread
+	url = https://github.com/hatRiot/libread.git
