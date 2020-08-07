@@ -1,13 +1,24 @@
 #include <Windows.h>
 #include <stdio.h>
 #include <Psapi.h>
+#include <sstream>
+#include <iomanip>
 #include "../libread/libread/libread.h"
+
+#pragma comment(lib, "BCrypt.lib")
 
 static const char *AdoRdrPath = "C:\\Program Files\\Adobe\\Acrobat Reader DC\\Reader\\AcroRd32.exe";
 static bool ShouldStop = false;
 
 // if we're incorrectly identifying the offset of ThreadPingEventReady, set and recompile here
 static int TARGET_OFFSET = 0;
+static int CallCount = 0;
+static int CallDup = 0;
+
+enum MONITOR_ACTION {
+	PRINT_TO_STDOUT = 1,
+	LOG_TO_FILE
+};
 
 HMODULE GetModule(HANDLE hProcess)
 {
@@ -153,12 +164,92 @@ void PrintCall(HANDLE hProcess, DWORD dwThreadId, DWORD CallEsp)
 	delete control;
 }
 
+// generate a SHA512 of the file 
+std::string CreateFileHash(LPVOID lpBuffer, SIZE_T dwBufSize)
+{
+	BCRYPT_ALG_HANDLE hAlg = NULL;
+	BCRYPT_HASH_HANDLE hHash = NULL;
+	LPVOID lpHash = NULL;
+	DWORD dwHashLen = 0, dwRet = 0, cbHashObject = 0;
+	PBYTE pbHashObject = NULL;
+
+	BCryptOpenAlgorithmProvider(&hAlg, 
+		BCRYPT_SHA512_ALGORITHM,
+		NULL, 0);
+
+	BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PBYTE)&dwHashLen, sizeof(DWORD), &dwRet, 0);
+
+	lpHash = VirtualAlloc(NULL, dwHashLen, MEM_COMMIT, PAGE_READWRITE);
+
+	BCryptCreateHash(hAlg, &hHash, pbHashObject, cbHashObject, NULL, 0, 0);
+	BCryptHashData(hHash, (PBYTE)lpBuffer, dwBufSize, 0);
+	BCryptFinishHash(hHash, (PBYTE)lpHash, dwHashLen, 0);
+
+	BCryptCloseAlgorithmProvider(hAlg, 0);
+	BCryptDestroyHash(hHash);
+	BCryptFreeBuffer(pbHashObject);
+
+	std::stringstream ss;
+	ss << std::hex << std::setfill('0');
+	for (int i = 0; i < dwHashLen; ++i)
+		ss << std::setw(2) << (int)(*((BYTE*)lpHash + i));
+
+	VirtualFree(lpHash, dwRet, MEM_RELEASE);
+	return ss.str().c_str();
+}
+
+/*
+ Dumps a channel buffer to disk. This captures the entire channel buffer to provide an easy way to replay traffic in external tools or
+ generate corpus.
+ Writes all cases to local folder "capture". File names are SHA512's of the channel buffer data; this gives us a unique filename and baked in dedup.
+ Easy to strip that out if you want all traffic captured.
+*/
+void LogCall(HANDLE hProcess, DWORD CallEsp)
+{
+	DWORD dwAddress = 0, dwChanLen = 0, dwWritten = 0;
+	ReadProcessMemory(hProcess, (LPVOID)(CallEsp + 4), &dwAddress, sizeof(DWORD), NULL);
+	ServerControl *control = new ServerControl(hProcess, dwAddress);
+
+	// we can find the buffer size by grabbing the final parameter's offset, which is an offset to the end of the channel buffer
+	DWORD idx = control->channel->crosscall->params_count - 1;
+	DWORD dwEndPtr = control->channel_buffer + control->channel->crosscall->parameters[idx].offset + control->channel->crosscall->parameters[idx].size;
+	dwChanLen = dwEndPtr - control->channel_buffer;
+	LPVOID lpBuf = control->Read(control->channel_buffer, dwChanLen);
+
+	std::string filehash = CreateFileHash(lpBuf, dwChanLen);
+	filehash.insert(0, ".\\capture\\");
+	CreateDirectoryA(".\\capture", NULL);
+
+	HANDLE hFile = CreateFileA(filehash.c_str(),
+		GENERIC_WRITE|GENERIC_READ,
+		FILE_SHARE_READ,
+		NULL,
+		CREATE_NEW,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+
+	if (hFile == INVALID_HANDLE_VALUE) {
+		// already exists; skip it
+		CallDup++;
+		goto cleanup;
+	}
+
+	if (!WriteFile(hFile, lpBuf, dwChanLen, &dwWritten, NULL))
+		printf("[-] FAILED to write capture file: %d\n", GetLastError());
+
+	CloseHandle(hFile);
+	CallCount++;
+	
+cleanup:
+	VirtualFree(lpBuf, dwChanLen, MEM_RELEASE);
+}
+
 /*
  Sets a breakpoint on ThreadPingEventReady; every time it's called we parse out the channel buffer and print it
  to the screen, then continue execution. We could also duplicate the server's ping handle, but then we're in a race to fetch
  the channel buffer before it's trashed by another request. 
 */
-void Monitor(DWORD dwPid)
+void Monitor(DWORD dwPid, MONITOR_ACTION Action)
 {
 	if (TARGET_OFFSET <= 0)
 		TARGET_OFFSET = CaptureThreadAlertOffset();
@@ -198,7 +289,18 @@ void Monitor(DWORD dwPid)
 						HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, false, dbgEvent.dwThreadId);
 						GetThreadContext(hThread, &lpContext);
 
-						PrintCall(hProcess, dbgEvent.dwThreadId, lpContext.Esp);
+						// do something
+						switch (Action)
+						{
+							case PRINT_TO_STDOUT:
+								PrintCall(hProcess, dbgEvent.dwThreadId, lpContext.Esp);
+								break;
+							case LOG_TO_FILE:
+								LogCall(hProcess, lpContext.Esp);
+								break;
+							default:
+								break;
+						}
 
 						lpContext.Eip--;
 						lpContext.EFlags |= 0x100;
@@ -334,6 +436,7 @@ void Help()
 	printf("          -m   -  Monitor mode\n");
 	printf("          -d   -  Dump channels\n");
 	printf("          -t   -  Trigger test call (tag 62)\n");
+	printf("          -c   -  Capture IPC traffic and log to disk\n");
 	printf("          -h   -  Print this menu\n");
 }
 
@@ -348,13 +451,19 @@ int main(int argc, char **argv)
 
 	DWORD dwPid = atoi(argv[2]);
 	if (strcmp(argv[1], "-m") == 0) {
-		Monitor(dwPid);
+		Monitor(dwPid, PRINT_TO_STDOUT);
 	}
 	else if (strcmp(argv[1], "-d") == 0) {
 		Dump(dwPid);
 	}
 	else if (strcmp(argv[1], "-t") == 0) {
 		TriggerIPC(dwPid);
+	}
+	else if (strcmp(argv[1], "-c") == 0)
+	{
+		printf("[+] Capturing calls...\n");
+		Monitor(dwPid, LOG_TO_FILE);
+		printf("[+] %d calls recorded, %d duplicates (%d total)\n", CallCount, CallDup, (CallCount + CallDup));
 	}
 	else
 		printf("[-] Unrecognized option\n");
