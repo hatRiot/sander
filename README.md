@@ -10,6 +10,7 @@ $ sander.exe -h
           -m   -  Monitor mode
           -d   -  Dump channels
           -t   -  Trigger test call (tag 62)
+	  -c   -  Capture IPC traffic and log to disk
           -h   -  Print this menu
 ```
 
